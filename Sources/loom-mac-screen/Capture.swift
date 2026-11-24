@@ -1,5 +1,6 @@
 import CoreMedia
 import Foundation
+import IOKit.pwr_mgt
 import ScreenCaptureKit
 
 /// The main display through ScreenCaptureKit, into the encoder. ScreenCaptureKit
@@ -13,6 +14,13 @@ final class Capture: NSObject, SCStreamOutput, SCStreamDelegate {
     private var display: SCDisplay?
     private var scale = 1
     private var last: CVPixelBuffer?
+    // While the Mac has no display of its own to show; see Virtual.swift.
+    // Kept for the life of the process, which ends a while after the last
+    // viewer: made and dropped per viewer, the one just dropped is still
+    // listed for a moment, and capturing it fails.
+    private var virtual: VirtualDisplay?
+    // Held while capturing: see `awake()`.
+    private var assertion: IOPMAssertionID = 0
     private let encoder: Encoder
     private let onError: (String) -> Void
 
@@ -22,11 +30,11 @@ final class Capture: NSObject, SCStreamOutput, SCStreamDelegate {
     }
 
     func start() {
+        awake()
         Task {
             do {
-                let content = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: true)
-                guard let display = content.displays.first(where: { $0.displayID == CGMainDisplayID() }) ?? content.displays.first else {
-                    onError("this Mac has no display to show")
+                guard let display = try await self.display() else {
+                    onError("this Mac has no display to show, and making one failed")
                     return
                 }
                 let stream = SCStream(filter: SCContentFilter(display: display, excludingWindows: []), configuration: configuration(display), delegate: self)
@@ -51,8 +59,48 @@ final class Capture: NSObject, SCStreamOutput, SCStreamDelegate {
             self.stream = nil
             self.last = nil
             self.encoder.stop()
+            if self.assertion != 0 {
+                IOPMAssertionRelease(self.assertion)
+                self.assertion = 0
+            }
             Task { try? await stream?.stopCapture() }
         }
+    }
+
+    /// The Mac drawing its screen while someone watches. With the lid shut on
+    /// AC it sits in a dark wake: awake, but with every display off and
+    /// nothing composited, so there is no frame to capture. Declaring user
+    /// activity brings it to a full wake, as a key press would; the display
+    /// is then kept from sleeping until the last viewer goes.
+    private func awake() {
+        var activity: IOPMAssertionID = 0
+        IOPMAssertionDeclareUserActivity("Loom: someone is watching the screen" as CFString, kIOPMUserActiveLocal, &activity)
+        queue.async {
+            guard self.assertion == 0 else { return }
+            IOPMAssertionCreateWithName(
+                kIOPMAssertionTypePreventUserIdleDisplaySleep as CFString, IOPMAssertionLevel(kIOPMAssertionLevelOn),
+                "Loom: someone is watching the screen" as CFString, &self.assertion)
+        }
+    }
+
+    /// The main display, or, with none to show (the lid shut), a virtual one
+    /// made for the purpose, once WindowServer lists it.
+    private func display() async throws -> SCDisplay? {
+        let content = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: true)
+        if let d = content.displays.first(where: { $0.displayID == CGMainDisplayID() }) ?? content.displays.first {
+            return d
+        }
+        let made: VirtualDisplay? = await MainActor.run {
+            if self.virtual == nil { self.virtual = VirtualDisplay() }
+            return self.virtual
+        }
+        guard let made else { return nil }
+        for _ in 0..<30 {
+            try await Task.sleep(nanoseconds: 100_000_000)
+            let content = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: true)
+            if let d = content.displays.first(where: { $0.displayID == made.id }) ?? content.displays.first { return d }
+        }
+        return nil
     }
 
     func keyframe() {

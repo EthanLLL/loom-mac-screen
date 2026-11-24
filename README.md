@@ -10,6 +10,11 @@ the page decodes it with WebCodecs.
   no B-frames, keyframes on request). An idle screen sends nothing.
 - Input as CGEvents, keys by position (`KeyboardEvent.code`), so the Mac's own
   input source makes the text.
+- With the lid shut and no monitor, the Mac has no display to show: a
+  virtual one is made (CoreGraphics' private `CGVirtualDisplay`, as DeskPad
+  and BetterDisplay use) for as long as the process runs, and the Mac is
+  brought out of its dark wake and kept from display sleep while someone
+  watches.
 - Started by launchd when something connects (socket activation), gone 30 s
   after the last viewer.
 
