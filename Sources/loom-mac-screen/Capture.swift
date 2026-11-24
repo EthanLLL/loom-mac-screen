@@ -21,6 +21,7 @@ final class Capture: NSObject, SCStreamOutput, SCStreamDelegate {
     private var virtual: VirtualDisplay?
     // Held while capturing: see `awake()`.
     private var assertion: IOPMAssertionID = 0
+    private var activity: IOPMAssertionID = 0
     private let encoder: Encoder
     private let onError: (String) -> Void
 
@@ -59,10 +60,9 @@ final class Capture: NSObject, SCStreamOutput, SCStreamDelegate {
             self.stream = nil
             self.last = nil
             self.encoder.stop()
-            if self.assertion != 0 {
-                IOPMAssertionRelease(self.assertion)
-                self.assertion = 0
-            }
+            for id in [self.assertion, self.activity] where id != 0 { IOPMAssertionRelease(id) }
+            self.assertion = 0
+            self.activity = 0
             Task { try? await stream?.stopCapture() }
         }
     }
@@ -73,9 +73,10 @@ final class Capture: NSObject, SCStreamOutput, SCStreamDelegate {
     /// activity brings it to a full wake, as a key press would; the display
     /// is then kept from sleeping until the last viewer goes.
     private func awake() {
-        var activity: IOPMAssertionID = 0
-        IOPMAssertionDeclareUserActivity("Loom: someone is watching the screen" as CFString, kIOPMUserActiveLocal, &activity)
         queue.async {
+            // Declared again for each viewer, under the same id, so they do
+            // not pile up; released with the other when the last one goes.
+            IOPMAssertionDeclareUserActivity("Loom: someone is watching the screen" as CFString, kIOPMUserActiveLocal, &self.activity)
             guard self.assertion == 0 else { return }
             IOPMAssertionCreateWithName(
                 kIOPMAssertionTypePreventUserIdleDisplaySleep as CFString, IOPMAssertionLevel(kIOPMAssertionLevelOn),
