@@ -5,15 +5,23 @@ import Foundation
 /// its WebRTC bridge, is what dials in). Every viewer gets the same picture;
 /// input from any of them is posted.
 ///
-/// A viewer that can't keep up — frames queued beyond `behind` bytes — is
-/// skipped until the next keyframe, which it is then sent: H.264 can't drop
-/// a frame in the middle and decode what follows.
+/// A viewer that can't keep up — its oldest unsent frame more than `behind`
+/// old — is skipped until it has caught up, then sent the next keyframe,
+/// asked for only then: H.264 can't drop a frame in the middle and decode
+/// what follows, and keyframes asked for while it is still behind would
+/// only queue behind each other. Time, not bytes: on a slow relay a few
+/// hundred KB is already seconds, and a stale picture is worse than fewer
+/// frames. The wait behind a keyframe is forgiven once it is out: on a slow
+/// line one takes a second or two by itself, and counting that would ask
+/// for keyframes for ever.
 final class Server {
     final class Viewer {
         let fd: Int32
         let queue: DispatchQueue
-        var queued = 0
+        /// When each frame still being written was queued, oldest first.
+        var unsent: [(at: UInt64, key: Bool)] = []
         var waitingKey = true
+        var askedKey = false
         init(fd: Int32) {
             self.fd = fd
             queue = DispatchQueue(label: "viewer-\(fd)")
@@ -22,7 +30,10 @@ final class Server {
 
     private let lock = NSLock()
     private var viewers: [Int32: Viewer] = [:]
-    private let behind = 4 << 20
+    private let behind: UInt64 = 500_000_000  // ns
+    /// What the kernel may hold for a viewer: a little, so `unsent` sees a
+    /// slow one soon. Loopback drains a fast one at once.
+    private let socketBuffer: Int32 = 128 << 10
 
     var onFirst: () -> Void = {}
     var onLast: () -> Void = {}
@@ -45,6 +56,8 @@ final class Server {
                 var one: Int32 = 1
                 setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, socklen_t(MemoryLayout<Int32>.size))
                 setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &one, socklen_t(MemoryLayout<Int32>.size))
+                var size = self.socketBuffer
+                setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &size, socklen_t(MemoryLayout<Int32>.size))
                 self.add(Viewer(fd: fd))
             }
         }
@@ -114,22 +127,30 @@ final class Server {
         }
         message.append(Wire.message(Wire.frame, payload))
 
-        var lagging = false
+        let now = DispatchTime.now().uptimeNanoseconds
+        var ask = false
         for v in lock.withLock({ Array(viewers.values) }) {
-            let skip: Bool = lock.withLock {
-                if v.waitingKey && !frame.key { return true }
-                if v.queued > behind {
+            let send: Bool = lock.withLock {
+                if let oldest = v.unsent.first, now - oldest.at > behind {
                     v.waitingKey = true
-                    lagging = true
+                    v.askedKey = false
+                    return false
+                }
+                guard v.waitingKey else { return true }
+                if frame.key {
+                    v.waitingKey = false
                     return true
                 }
-                v.waitingKey = false
+                // Caught up, and waiting for a keyframe: ask, once.
+                if !v.askedKey {
+                    v.askedKey = true
+                    ask = true
+                }
                 return false
             }
-            if skip { continue }
-            write(v, message)
+            if send { write(v, message, frame: true, key: frame.key) }
         }
-        if lagging { onKeyframe() }
+        if ask { onKeyframe() }
     }
 
     func send(error message: String) {
@@ -137,8 +158,8 @@ final class Server {
         for v in lock.withLock({ Array(viewers.values) }) { write(v, data) }
     }
 
-    private func write(_ v: Viewer, _ data: Data) {
-        lock.withLock { v.queued += data.count }
+    private func write(_ v: Viewer, _ data: Data, frame: Bool = false, key: Bool = false) {
+        if frame { lock.withLock { v.unsent.append((DispatchTime.now().uptimeNanoseconds, key)) } }
         v.queue.async {
             let ok = data.withUnsafeBytes { raw -> Bool in
                 var sent = 0
@@ -148,7 +169,19 @@ final class Server {
                 }
                 return true
             }
-            self.lock.withLock { v.queued -= data.count }
+            // All sent while waiting for a keyframe: ask now, or a screen
+            // that has stopped changing never sends the frame that asks.
+            let ask = frame && self.lock.withLock { () -> Bool in
+                let done = v.unsent.removeFirst()
+                if done.key {
+                    let now = DispatchTime.now().uptimeNanoseconds
+                    v.unsent = v.unsent.map { (now, $0.key) }
+                }
+                guard v.unsent.isEmpty, v.waitingKey, !v.askedKey else { return false }
+                v.askedKey = true
+                return true
+            }
+            if ask { self.onKeyframe() }
             if !ok { self.drop(v) }
         }
     }
