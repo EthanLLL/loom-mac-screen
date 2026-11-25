@@ -77,9 +77,9 @@ server.onFirst = { capture.start() }
 server.onKeyframe = { capture.keyframe() }
 server.onInput = { data in inputQueue.async { input.handle(data) } }
 server.onSettings = { data in
-    if let m = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any], let s = m["scale"] as? Int {
-        capture.setScale(s)
-    }
+    guard let m = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] else { return }
+    if let s = m["scale"] as? Int { capture.setScale(s) }
+    if let w = m["width"] as? Int, let h = m["height"] as? Int { capture.setSize(width: w, height: h) }
 }
 server.onLast = {
     capture.stop()
@@ -88,6 +88,7 @@ server.onLast = {
     DispatchQueue.main.asyncAfter(deadline: .now() + idleExit) {
         if server.count == 0 {
             log("no viewers for \(Int(idleExit))s; exiting")
+            capture.leave()
             exit(0)
         }
     }

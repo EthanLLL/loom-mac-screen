@@ -10,7 +10,9 @@ import Foundation
 //   viewer → screen
 //     10 input     JSON, see Input.swift
 //     11 keyframe  empty: the viewer has lost its place
-//     12 settings  JSON {scale}: 1 for the display's points, 2 for its pixels
+//     12 settings  JSON {scale, width?, height?}: scale 1 for the display's
+//                  points, 2 for its pixels; width and height, in pixels,
+//                  what a virtual display (lid shut) is to be, at 2×
 enum Wire {
     static let config: UInt8 = 1
     static let frame: UInt8 = 2

@@ -13,6 +13,10 @@ final class Capture: NSObject, SCStreamOutput, SCStreamDelegate {
     private var stream: SCStream?
     private var display: SCDisplay?
     private var scale = 1
+    /// The size a viewer asked the virtual display to be, in points.
+    private var wanted: (width: Int, height: Int)?
+    /// Whether a viewer has sent its settings: one that says no size wants none.
+    private var told = false
     private var last: CVPixelBuffer?
     // While the Mac has no display of its own to show; see Virtual.swift.
     // Kept for the life of the process, which ends a while after the last
@@ -85,23 +89,48 @@ final class Capture: NSObject, SCStreamOutput, SCStreamDelegate {
     }
 
     /// The main display, or, with none to show (the lid shut), a virtual one
-    /// made for the purpose, once WindowServer lists it.
+    /// made for the purpose, once WindowServer lists it. A display macOS
+    /// made itself for a screen-sharing session on a headless Mac (vendor
+    /// "unkn", product "virt", 1920×1080 at 1×) is not one to show: ours is
+    /// made all the same, and that one set to mirror it, so the desktop and
+    /// its windows are on ours, at the size a viewer asked for.
     private func display() async throws -> SCDisplay? {
         let content = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: true)
-        if let d = content.displays.first(where: { $0.displayID == CGMainDisplayID() }) ?? content.displays.first {
+        let ours = await MainActor.run { self.virtual?.id }
+        let real = content.displays.filter { $0.displayID != ours && !Self.madeByMacOS($0.displayID) && !Self.madeByUs($0.displayID) }
+        if let d = real.first(where: { $0.displayID == CGMainDisplayID() }) ?? real.first {
             return d
         }
+        // A viewer says its size just after it connects: made that size at
+        // once, rather than made and then changed.
+        for _ in 0..<15 where ours == nil && queue.sync(execute: { !self.told }) {
+            try await Task.sleep(nanoseconds: 100_000_000)
+        }
         let made: VirtualDisplay? = await MainActor.run {
-            if self.virtual == nil { self.virtual = VirtualDisplay() }
+            if self.virtual == nil {
+                self.virtual = self.wanted.flatMap { VirtualDisplay(width: $0.width, height: $0.height) } ?? VirtualDisplay()
+            }
             return self.virtual
         }
         guard let made else { return nil }
         for _ in 0..<30 {
             try await Task.sleep(nanoseconds: 100_000_000)
             let content = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: true)
-            if let d = content.displays.first(where: { $0.displayID == made.id }) ?? content.displays.first { return d }
+            if let d = content.displays.first(where: { $0.displayID == made.id }) {
+                await MainActor.run { made.mirror(content.displays.map(\.displayID).filter(Self.madeByMacOS)) }
+                return d
+            }
         }
         return nil
+    }
+
+    /// One of ours, the current one or one going away.
+    private static func madeByUs(_ id: CGDirectDisplayID) -> Bool {
+        CGDisplayVendorNumber(id) == VirtualDisplay.vendor && CGDisplayModelNumber(id) == VirtualDisplay.product
+    }
+
+    private static func madeByMacOS(_ id: CGDirectDisplayID) -> Bool {
+        CGDisplayVendorNumber(id) == 0x756e_6b6e && CGDisplayModelNumber(id) == 0x7669_7274  // "unkn", "virt"
     }
 
     func keyframe() {
@@ -115,12 +144,50 @@ final class Capture: NSObject, SCStreamOutput, SCStreamDelegate {
 
     func setScale(_ s: Int) {
         queue.async {
+            self.told = true
             let s = s == 2 ? 2 : 1
             guard s != self.scale else { return }
             self.scale = s
             guard let stream = self.stream, let display = self.display else { return }
             stream.updateConfiguration(self.configuration(display)) { error in
                 if let error { log("cannot rescale: \(error)") }
+            }
+        }
+    }
+
+    /// A viewer's own size for the virtual display, in pixels at 2×. Only a
+    /// display made for the purpose changes; a real one stays as it is.
+    func setSize(width: Int, height: Int) {
+        queue.async {
+            let points = (width: width / 2, height: height / 2)
+            guard points.width > 0, points.height > 0 else { return }
+            self.wanted = points
+            Task { @MainActor in
+                guard let virtual = self.virtual, self.displayID == virtual.id, virtual.size != points else { return }
+                // A display changed once may not take a second size: then a new one, that size.
+                if !virtual.resize(width: points.width, height: points.height) { self.virtual = nil }
+                self.restart()
+            }
+        }
+    }
+
+    /// Back to the default size before going: macOS keeps the last display
+    /// it had after the process is gone (with the lid shut it won't be left
+    /// with none), and whatever shows it next — Screen Sharing — should find
+    /// a Mac's usual screen, not a phone's half. On the main queue, where
+    /// the virtual display lives.
+    func leave() {
+        _ = virtual?.resize(width: VirtualDisplay.defaultSize.width, height: VirtualDisplay.defaultSize.height)
+    }
+
+    /// The stream again, on the display as it now is.
+    private func restart() {
+        queue.async {
+            let stream = self.stream
+            self.stream = nil
+            Task {
+                try? await stream?.stopCapture()
+                self.start()
             }
         }
     }
