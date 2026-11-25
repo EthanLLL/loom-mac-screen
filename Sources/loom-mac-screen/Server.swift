@@ -31,6 +31,8 @@ final class Server {
     private let lock = NSLock()
     private var viewers: [Int32: Viewer] = [:]
     private let behind: UInt64 = 500_000_000  // ns
+    /// Frames written to viewers, and held back from them, since last logged.
+    private var sent = (written: 0, held: 0)
     /// What the kernel may hold for a viewer: a little, so `unsent` sees a
     /// slow one soon. Loopback drains a fast one at once.
     private let socketBuffer: Int32 = 128 << 10
@@ -148,9 +150,17 @@ final class Server {
                 }
                 return false
             }
+            lock.withLock { if send { sent.written += 1 } else { sent.held += 1 } }
             if send { write(v, message, frame: true, key: frame.key) }
         }
         if ask { onKeyframe() }
+    }
+
+    func tally() -> String {
+        lock.withLock {
+            defer { sent = (0, 0) }
+            return "\(sent.written) sent, \(sent.held) held to \(viewers.count) viewers"
+        }
     }
 
     func send(error message: String) {

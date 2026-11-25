@@ -70,6 +70,7 @@ if !AXIsProcessTrustedWithOptions([kAXTrustedCheckOptionPrompt.takeUnretainedVal
 let server = Server()
 let encoder = Encoder { server.send(frame: $0) }
 let capture = Capture(encoder: encoder) { server.send(error: $0) }
+capture.report = { server.tally() }
 let input = Input { capture.displayID }
 let inputQueue = DispatchQueue(label: "input", qos: .userInteractive)
 

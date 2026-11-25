@@ -18,6 +18,11 @@ final class Capture: NSObject, SCStreamOutput, SCStreamDelegate {
     /// Whether a viewer has sent its settings: one that says no size wants none.
     private var told = false
     private var last: CVPixelBuffer?
+    /// Which start is the current one: a stop, or a start begun again,
+    /// supersedes it, and a stream it still brings up is stopped at once.
+    private var generation = 0
+    /// What came out of the display lately, logged every few seconds.
+    private var tally = (frames: 0, luma: 0, since: Date())
     // While the Mac has no display of its own to show; see Virtual.swift.
     // Kept for the life of the process, which ends a while after the last
     // viewer: made and dropped per viewer, the one just dropped is still
@@ -27,6 +32,8 @@ final class Capture: NSObject, SCStreamOutput, SCStreamDelegate {
     private var assertion: IOPMAssertionID = 0
     private var activity: IOPMAssertionID = 0
     private let encoder: Encoder
+    /// What the server did with the frames, for the log.
+    var report: () -> String = { "" }
     private let onError: (String) -> Void
 
     init(encoder: Encoder, onError: @escaping (String) -> Void) {
@@ -36,6 +43,7 @@ final class Capture: NSObject, SCStreamOutput, SCStreamDelegate {
 
     func start() {
         awake()
+        let mine = queue.sync { generation += 1; return generation }
         Task {
             do {
                 guard let display = try await self.display() else {
@@ -45,6 +53,12 @@ final class Capture: NSObject, SCStreamOutput, SCStreamDelegate {
                 let stream = SCStream(filter: SCContentFilter(display: display, excludingWindows: []), configuration: configuration(display), delegate: self)
                 try stream.addStreamOutput(self, type: .screen, sampleHandlerQueue: queue)
                 try await stream.startCapture()
+                // A viewer that came and went at once, its start overtaken by the next one's.
+                guard queue.sync(execute: { self.generation == mine }) else {
+                    try? await stream.stopCapture()
+                    log("dropped a stream started for a viewer since gone")
+                    return
+                }
                 queue.async {
                     self.display = display
                     self.displayID = display.displayID
@@ -60,6 +74,7 @@ final class Capture: NSObject, SCStreamOutput, SCStreamDelegate {
 
     func stop() {
         queue.async {
+            self.generation += 1
             let stream = self.stream
             self.stream = nil
             self.last = nil
@@ -204,7 +219,30 @@ final class Capture: NSObject, SCStreamOutput, SCStreamDelegate {
               let raw = info.first?[.status] as? Int, SCFrameStatus(rawValue: raw) == .complete,
               let pixels = sample.imageBuffer else { return }
         last = pixels
+        count(pixels)
         encoder.encode(pixels, pts: sample.presentationTimeStamp)
+    }
+
+    /// Frames a second and their mean brightness (0–255, from a grid of the
+    /// luma plane), every five seconds: a black screen tells on itself here.
+    private func count(_ pixels: CVPixelBuffer) {
+        tally.frames += 1
+        if tally.frames % 10 == 1 {
+            CVPixelBufferLockBaseAddress(pixels, .readOnly)
+            if let base = CVPixelBufferGetBaseAddressOfPlane(pixels, 0) {
+                let w = CVPixelBufferGetWidthOfPlane(pixels, 0), h = CVPixelBufferGetHeightOfPlane(pixels, 0)
+                let row = CVPixelBufferGetBytesPerRowOfPlane(pixels, 0)
+                let y = base.assumingMemoryBound(to: UInt8.self)
+                var sum = 0
+                for i in 1...16 { for j in 1...16 { sum += Int(y[h * i / 17 * row + w * j / 17]) } }
+                tally.luma = sum / 256
+            }
+            CVPixelBufferUnlockBaseAddress(pixels, .readOnly)
+        }
+        let elapsed = Date().timeIntervalSince(tally.since)
+        guard elapsed >= 5 else { return }
+        log("display \(displayID): \(Int(Double(tally.frames) / elapsed)) frames/s, luma \(tally.luma), \(CVPixelBufferGetWidth(pixels))x\(CVPixelBufferGetHeight(pixels)); encoder \(encoder.tally()); \(report())")
+        tally = (0, tally.luma, Date())
     }
 
     func stream(_ stream: SCStream, didStopWithError error: Error) {

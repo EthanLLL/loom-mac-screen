@@ -22,6 +22,9 @@ final class Encoder {
     private var height = 0
     private var forceKey = true
     private let bitrate: Int
+    /// Frames out, and the last failure, since the capture last logged them.
+    private let counts = NSLock()
+    private var out = (frames: 0, keys: 0, failed: OSStatus(0))
     private let onFrame: (Frame) -> Void
 
     init(bitrate: Int = 12_000_000, onFrame: @escaping (Frame) -> Void) {
@@ -47,9 +50,21 @@ final class Encoder {
         VTCompressionSessionEncodeFrame(
             session, imageBuffer: pixels, presentationTimeStamp: pts, duration: .invalid,
             frameProperties: props, infoFlagsOut: nil
-        ) { [onFrame] status, _, sample in
-            guard status == noErr, let sample, let frame = Encoder.annexB(sample, width: fw, height: fh) else { return }
+        ) { [self] status, _, sample in
+            guard status == noErr, let sample, let frame = Encoder.annexB(sample, width: fw, height: fh) else {
+                counts.withLock { out.failed = status == noErr ? -1 : status }
+                return
+            }
+            counts.withLock { out.frames += 1; if frame.key { out.keys += 1 } }
             onFrame(frame)
+        }
+    }
+
+    /// "N out (K keys)", and the last failure if any, counted afresh.
+    func tally() -> String {
+        counts.withLock {
+            defer { out = (0, 0, 0) }
+            return "\(out.frames) out (\(out.keys) keys)" + (out.failed != 0 ? ", failed \(out.failed)" : "")
         }
     }
 
