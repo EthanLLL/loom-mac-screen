@@ -164,20 +164,14 @@ final class Capture: NSObject, SCStreamOutput, SCStreamDelegate {
             self.wanted = points
             Task { @MainActor in
                 guard let virtual = self.virtual, self.displayID == virtual.id, virtual.size != points else { return }
-                // A display changed once may not take a second size: then a new one, that size.
-                if !virtual.resize(width: points.width, height: points.height) { self.virtual = nil }
+                // Should it refuse the size, a new one that size, made before the old one
+                // goes, or macOS makes its own 1920×1080 in between; failing that, the old one.
+                if !virtual.resize(width: points.width, height: points.height) {
+                    self.virtual = VirtualDisplay(width: points.width, height: points.height) ?? virtual
+                }
                 self.restart()
             }
         }
-    }
-
-    /// Back to the default size before going: macOS keeps the last display
-    /// it had after the process is gone (with the lid shut it won't be left
-    /// with none), and whatever shows it next — Screen Sharing — should find
-    /// a Mac's usual screen, not a phone's half. On the main queue, where
-    /// the virtual display lives.
-    func leave() {
-        _ = virtual?.resize(width: VirtualDisplay.defaultSize.width, height: VirtualDisplay.defaultSize.height)
     }
 
     /// The stream again, on the display as it now is.

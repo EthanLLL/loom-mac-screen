@@ -3,9 +3,8 @@ import Foundation
 
 /// A display for a Mac that has none to show: its lid shut and nothing
 /// plugged in, so the built-in screen sleeps and ScreenCaptureKit finds no
-/// display. Made while someone is watching. macOS keeps it after the
-/// process is gone, until another display comes (the next one made here
-/// replaces it), so it is set back to the default size on the way out.
+/// display. Made while someone is watching; when the process is gone,
+/// macOS puts its own headless 1920×1080 in its place.
 ///
 /// The size is an M2 Air's default, 1470×956 points at 2×, until a viewer
 /// asks for its own (`resize`): a phone's half screen, say, filled pixel
@@ -20,10 +19,14 @@ final class VirtualDisplay {
 
     // Room to grow into: the descriptor's maximum can't change later.
     private static let maxPixels = 4096
+    private static var serial: UInt32 = 0
+    private static let queue = DispatchQueue(label: "virtual display")
 
     init?(width: Int = defaultSize.width, height: Int = defaultSize.height) {
         let d = CGVirtualDisplayDescriptor()
-        d.setDispatchQueue(DispatchQueue.main)
+        // Its own, not main: `choose` waits on main for the modes this
+        // queue's work brings.
+        d.setDispatchQueue(Self.queue)
         d.name = "Loom"
         d.maxPixelsWide = UInt32(Self.maxPixels)
         d.maxPixelsHigh = UInt32(Self.maxPixels)
@@ -31,7 +34,10 @@ final class VirtualDisplay {
         d.sizeInMillimeters = CGSize(width: 300, height: 195)
         d.vendorID = Self.vendor
         d.productID = Self.product
-        d.serialNum = 1
+        // Two serials in turn: one made to replace another is a second
+        // display while both are up, not the same one again (which fails).
+        Self.serial = Self.serial % 2 + 1
+        d.serialNum = Self.serial
         guard let display = CGVirtualDisplay(descriptor: d) else { return nil }
         self.display = display
         size = (width, height)
@@ -56,15 +62,19 @@ final class VirtualDisplay {
             CGVirtualDisplayMode(width: UInt(width * 2), height: UInt(height * 2), refreshRate: 60),
             CGVirtualDisplayMode(width: UInt(width), height: UInt(height), refreshRate: 60),
         ]
-        guard display.apply(s) else { return false }
-        return choose(width: width, height: height)
+        // Now and then the modes given are never listed: given again.
+        for _ in 0..<3 {
+            guard display.apply(s) else { return false }
+            if choose(width: width, height: height) { return true }
+        }
+        return false
     }
 
     /// Offering a 2× mode isn't using it: the system may pick the 1× one, or
     /// another it lists. Switch to the 2× one by name, once it is listed.
     private func choose(width: Int, height: Int) -> Bool {
         let options = [kCGDisplayShowDuplicateLowResolutionModes: kCFBooleanTrue] as CFDictionary
-        for _ in 0..<20 {
+        for _ in 0..<40 {
             let modes = (CGDisplayCopyAllDisplayModes(display.displayID, options) as? [CGDisplayMode]) ?? []
             if let mode = modes.first(where: { $0.width == width && $0.height == height && $0.pixelWidth == width * 2 }) {
                 var config: CGDisplayConfigRef?

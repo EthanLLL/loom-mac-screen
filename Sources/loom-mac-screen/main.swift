@@ -88,7 +88,6 @@ server.onLast = {
     DispatchQueue.main.asyncAfter(deadline: .now() + idleExit) {
         if server.count == 0 {
             log("no viewers for \(Int(idleExit))s; exiting")
-            capture.leave()
             exit(0)
         }
     }
