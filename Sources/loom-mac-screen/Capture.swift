@@ -12,8 +12,23 @@ final class Capture: NSObject, SCStreamOutput, SCStreamDelegate {
     private(set) var displayID = CGMainDisplayID()
     private var stream: SCStream?
     private var display: SCDisplay?
-    private var scale = 1
-    /// The size a viewer asked the virtual display to be, in points.
+    /// The line to the viewers is narrow: anything but a phone on the Mac's
+    /// own Wi-Fi (so 5G, another network, round by the Loom, or a viewer
+    /// that never says). Narrow, the picture is a pixel a point at 1.5 Mbit/s
+    /// and 30 frames a second, steady: a lower fixed rate played smoothly
+    /// beat one chasing the line, which stalls each time it falls behind.
+    /// Wide, the viewer's own pixels at 12 Mbit/s and 60 frames a second,
+    /// halved each time a viewer falls behind and never raised again for it.
+    private var narrow = true
+    private static let wide = [12_000_000, 6_000_000, 3_000_000, 1_500_000]
+    private static let narrowRate = 1_500_000
+    private var level = 0
+    private var lastStep = Date.distantPast
+    /// The viewer's pixels for the virtual display, and the points it is
+    /// laid out in: 1.5 pixels a point, so the Mac lays out about as on a
+    /// laptop rather than a tablet (on the Duo's upper half 1252×889 points,
+    /// not 939×667, at which pages took their narrow layouts).
+    private var asked: (width: Int, height: Int)?
     private var wanted: (width: Int, height: Int)?
     /// Whether a viewer has sent its settings: one that says no size wants none.
     private var told = false
@@ -21,12 +36,19 @@ final class Capture: NSObject, SCStreamOutput, SCStreamDelegate {
     /// Which start is the current one: a stop, or a start begun again,
     /// supersedes it, and a stream it still brings up is stopped at once.
     private var generation = 0
+    /// The start each stream was made for: a frame from one whose start is
+    /// no longer current stops it (a stop that missed it, or a stream
+    /// that came up after it).
+    private var made: [ObjectIdentifier: Int] = [:]
     /// What came out of the display lately, logged every few seconds.
     private var tally = (frames: 0, luma: 0, since: Date())
     // While the Mac has no display of its own to show; see Virtual.swift.
-    // Kept for the life of the process, which ends a while after the last
-    // viewer: made and dropped per viewer, the one just dropped is still
-    // listed for a moment, and capturing it fails.
+    // One for the life of the process, which ends five seconds after the
+    // last viewer (main.swift), taking it with it: one dropped and made
+    // again in the same process lists no modes, however long after. macOS
+    // takes it away in its own time, and one made while it is still
+    // listed gets none either, so a new process waits for it to go: never
+    // two of ours at once.
     private var virtual: VirtualDisplay?
     // Held while capturing: see `awake()`.
     private var assertion: IOPMAssertionID = 0
@@ -41,7 +63,9 @@ final class Capture: NSObject, SCStreamOutput, SCStreamDelegate {
         self.onError = onError
     }
 
-    func start() {
+    /// Tried again, a second apart, up to three times: just after the Mac
+    /// wakes, the display it shows can be listed yet refuse a stream.
+    func start(attempt: Int = 1) {
         awake()
         let mine = queue.sync { generation += 1; return generation }
         Task {
@@ -52,6 +76,7 @@ final class Capture: NSObject, SCStreamOutput, SCStreamDelegate {
                 }
                 let stream = SCStream(filter: SCContentFilter(display: display, excludingWindows: []), configuration: configuration(display), delegate: self)
                 try stream.addStreamOutput(self, type: .screen, sampleHandlerQueue: queue)
+                queue.sync { self.made[ObjectIdentifier(stream)] = mine }
                 try await stream.startCapture()
                 // A viewer that came and went at once, its start overtaken by the next one's.
                 guard queue.sync(execute: { self.generation == mine }) else {
@@ -63,10 +88,18 @@ final class Capture: NSObject, SCStreamOutput, SCStreamDelegate {
                     self.display = display
                     self.displayID = display.displayID
                     self.stream = stream
+                    // A size asked for while this start was under way, for a display
+                    // made before it (by a viewer that left at once), applies now.
+                    if let a = self.asked { self.setSize(width: a.width, height: a.height) }
                 }
-                log("capturing display \(display.displayID), \(display.width)x\(display.height) points")
+                log("capturing display \(display.displayID) (vendor \(String(CGDisplayVendorNumber(display.displayID), radix: 16))), \(display.width)x\(display.height) points")
             } catch {
                 log("cannot capture: \(error)")
+                if attempt < 3, queue.sync(execute: { self.generation == mine }) {
+                    try? await Task.sleep(nanoseconds: 1_000_000_000)
+                    if queue.sync(execute: { self.generation == mine }) { self.start(attempt: attempt + 1) }
+                    return
+                }
                 onError("Screen Recording is not allowed for LoomMacScreen: on the Mac, System Settings → Privacy & Security → Screen & System Audio Recording (\(error.localizedDescription))")
             }
         }
@@ -75,6 +108,10 @@ final class Capture: NSObject, SCStreamOutput, SCStreamDelegate {
     func stop() {
         queue.async {
             self.generation += 1
+            self.told = false
+            self.narrow = true
+            self.level = 0
+            self.encoder.setBitrate(Self.narrowRate)
             let stream = self.stream
             self.stream = nil
             self.last = nil
@@ -110,16 +147,28 @@ final class Capture: NSObject, SCStreamOutput, SCStreamDelegate {
     /// made all the same, and that one set to mirror it, so the desktop and
     /// its windows are on ours, at the size a viewer asked for.
     private func display() async throws -> SCDisplay? {
+        // A viewer says its size and line just after it connects: a display
+        // made that size, and a stream begun as it should be, rather than
+        // either changed at once (a still screen sends nothing after a
+        // change, so the viewer would wait for a frame that never comes).
+        for _ in 0..<15 where queue.sync(execute: { !self.told }) {
+            try await Task.sleep(nanoseconds: 100_000_000)
+        }
         let content = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: true)
         let ours = await MainActor.run { self.virtual?.id }
-        let real = content.displays.filter { $0.displayID != ours && !Self.madeByMacOS($0.displayID) && !Self.madeByUs($0.displayID) }
+        // A display macOS has only just made can say vendor 0 for a moment.
+        let real = content.displays.filter {
+            $0.displayID != ours && !Self.madeByMacOS($0.displayID) && !Self.madeByUs($0.displayID)
+                && (CGDisplayIsBuiltin($0.displayID) != 0 || CGDisplayVendorNumber($0.displayID) != 0)
+        }
         if let d = real.first(where: { $0.displayID == CGMainDisplayID() }) ?? real.first {
             return d
         }
-        // A viewer says its size just after it connects: made that size at
-        // once, rather than made and then changed.
-        for _ in 0..<15 where ours == nil && queue.sync(execute: { !self.told }) {
-            try await Task.sleep(nanoseconds: 100_000_000)
+        if await MainActor.run(body: { self.virtual == nil }) {
+            for i in 0..<50 where Self.anyOfOurs() {
+                if i == 0 { log("waiting for the last virtual display to go") }
+                try await Task.sleep(nanoseconds: 100_000_000)
+            }
         }
         let made: VirtualDisplay? = await MainActor.run {
             if self.virtual == nil {
@@ -137,6 +186,15 @@ final class Capture: NSObject, SCStreamOutput, SCStreamDelegate {
             }
         }
         return nil
+    }
+
+    /// Whether macOS still lists a display of ours.
+    private static func anyOfOurs() -> Bool {
+        var n: UInt32 = 0
+        CGGetOnlineDisplayList(0, nil, &n)
+        var ids = [CGDirectDisplayID](repeating: 0, count: Int(n))
+        CGGetOnlineDisplayList(n, &ids, &n)
+        return ids.prefix(Int(n)).contains(where: madeByUs)
     }
 
     /// One of ours, the current one or one going away.
@@ -157,32 +215,33 @@ final class Capture: NSObject, SCStreamOutput, SCStreamDelegate {
         }
     }
 
-    func setScale(_ s: Int) {
+    /// Whether the viewer's line is narrow; see `narrow`.
+    func setNarrow(_ n: Bool) {
         queue.async {
             self.told = true
-            let s = s == 2 ? 2 : 1
-            guard s != self.scale else { return }
-            self.scale = s
-            guard let stream = self.stream, let display = self.display else { return }
-            stream.updateConfiguration(self.configuration(display)) { error in
-                if let error { log("cannot rescale: \(error)") }
-            }
+            guard n != self.narrow else { return }
+            self.narrow = n
+            self.level = 0
+            self.encoder.setBitrate(n ? Self.narrowRate : Self.wide[0])
+            log("line \(n ? "narrow: 1.5 Mbps, 30 frames/s" : "wide: 12 Mbps, 60 frames/s")")
+            self.refit()
         }
     }
 
-    /// A viewer's own size for the virtual display, in pixels at 2×. Only a
+    /// A viewer's own size for the virtual display, in its pixels. Only a
     /// display made for the purpose changes; a real one stays as it is.
     func setSize(width: Int, height: Int) {
         queue.async {
-            let points = (width: width / 2, height: height / 2)
+            let points = (width: width * 2 / 3, height: height * 2 / 3)
             guard points.width > 0, points.height > 0 else { return }
+            self.asked = (width, height)
             self.wanted = points
             Task { @MainActor in
                 guard let virtual = self.virtual, self.displayID == virtual.id, virtual.size != points else { return }
-                // Should it refuse the size, a new one that size, made before the old one
-                // goes, or macOS makes its own 1920×1080 in between; failing that, the old one.
-                if !virtual.resize(width: points.width, height: points.height) {
-                    self.virtual = VirtualDisplay(width: points.width, height: points.height) ?? virtual
+                // Refused, it stays as it is (never a second one beside it), and the next size tries again.
+                guard virtual.resize(width: points.width, height: points.height) else {
+                    log("virtual display \(virtual.id) stays \(virtual.size.width)x\(virtual.size.height)")
+                    return
                 }
                 self.restart()
             }
@@ -201,12 +260,37 @@ final class Capture: NSObject, SCStreamOutput, SCStreamDelegate {
         }
     }
 
+    /// A viewer fell behind: on a wide line, half the rate (not again within
+    /// four seconds, while what was queued at the last one drains).
+    func behind() {
+        queue.async {
+            guard !self.narrow, self.level < Self.wide.count - 1, Date().timeIntervalSince(self.lastStep) >= 4 else { return }
+            self.level += 1
+            self.lastStep = Date()
+            self.encoder.setBitrate(Self.wide[self.level])
+            log("encoder now \(Double(Self.wide[self.level]) / 1e6) Mbps, 30 frames/s")
+            if self.level == 1 { self.refit() }
+        }
+    }
+
+    /// The stream's size and frame rate as they now should be. On the queue.
+    private func refit() {
+        guard let stream, let display else { return }
+        stream.updateConfiguration(configuration(display)) { error in
+            if let error { log("cannot change the stream: \(error)") }
+        }
+    }
+
     private func configuration(_ display: SCDisplay) -> SCStreamConfiguration {
         let c = SCStreamConfiguration()
-        // Even, as H.264 wants.
-        c.width = display.width * scale / 2 * 2
-        c.height = display.height * scale / 2 * 2
-        c.minimumFrameInterval = CMTime(value: 1, timescale: 60)
+        // Wide, ours at the viewer's own pixels (macOS draws it at 2× and
+        // scales down), any other at 2×; narrow, a pixel a point. Even, as
+        // H.264 wants.
+        var size = narrow ? (display.width, display.height) : (display.width * 2, display.height * 2)
+        if !narrow, let asked, Self.madeByUs(display.displayID) { size = asked }
+        c.width = size.0 / 2 * 2
+        c.height = size.1 / 2 * 2
+        c.minimumFrameInterval = CMTime(value: 1, timescale: narrow || level >= 1 ? 30 : 60)
         c.pixelFormat = kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange
         c.showsCursor = true
         c.queueDepth = 4
@@ -214,6 +298,12 @@ final class Capture: NSObject, SCStreamOutput, SCStreamDelegate {
     }
 
     func stream(_ stream: SCStream, didOutputSampleBuffer sample: CMSampleBuffer, of type: SCStreamOutputType) {
+        if let g = made[ObjectIdentifier(stream)], g != generation {
+            made[ObjectIdentifier(stream)] = nil
+            log("stopping a stream left running")
+            Task { try? await stream.stopCapture() }
+            return
+        }
         guard type == .screen, sample.isValid,
               let info = CMSampleBufferGetSampleAttachmentsArray(sample, createIfNecessary: false) as? [[SCStreamFrameInfo: Any]],
               let raw = info.first?[.status] as? Int, SCFrameStatus(rawValue: raw) == .complete,
@@ -241,7 +331,7 @@ final class Capture: NSObject, SCStreamOutput, SCStreamDelegate {
         }
         let elapsed = Date().timeIntervalSince(tally.since)
         guard elapsed >= 5 else { return }
-        log("display \(displayID): \(Int(Double(tally.frames) / elapsed)) frames/s, luma \(tally.luma), \(CVPixelBufferGetWidth(pixels))x\(CVPixelBufferGetHeight(pixels)); encoder \(encoder.tally()); \(report())")
+        log("display \(displayID): \(Int(Double(tally.frames) / elapsed)) frames/s, luma \(tally.luma), \(CVPixelBufferGetWidth(pixels))x\(CVPixelBufferGetHeight(pixels)); encoder \(encoder.tally()) at \(Double(encoder.bitrate) / 1e6) Mbps; \(report())")
         tally = (0, tally.luma, Date())
     }
 

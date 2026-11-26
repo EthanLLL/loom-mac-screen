@@ -8,15 +8,20 @@ the page decodes it with WebCodecs.
 
 - ScreenCaptureKit → VideoToolbox H.264 (real time, low-latency rate control,
   no B-frames, keyframes on request). An idle screen sends nothing.
+- A viewer on the Mac's own network says so (`"narrow": false` in its
+  settings) and gets its own pixels at 12 Mbit/s and 60 frames a second,
+  halved when it falls behind; any other gets a pixel a point at a steady
+  1.5 Mbit/s and 30 frames a second.
 - Input as CGEvents, keys by position (`KeyboardEvent.code`), so the Mac's own
   input source makes the text.
 - With the lid shut and no monitor, the Mac has no display to show: a
   virtual one is made (CoreGraphics' private `CGVirtualDisplay`, as DeskPad
-  and BetterDisplay use) for as long as the process runs, and the Mac is
+  and BetterDisplay use), laid out at 1.5 of the viewer's pixels a point,
+  for as long as the process runs (never two at once), and the Mac is
   brought out of its dark wake and kept from display sleep while someone
   watches.
-- Started by launchd when something connects (socket activation), gone 30 s
-  after the last viewer.
+- Started by launchd when something connects (socket activation), gone 5 s
+  after the last viewer, which is what takes the virtual display away.
 
 The protocol is in `Sources/loom-mac-screen/Wire.swift`.
 

@@ -21,18 +21,24 @@ final class Encoder {
     private var width = 0
     private var height = 0
     private var forceKey = true
-    private let bitrate: Int
+    private(set) var bitrate: Int
     /// Frames out, and the last failure, since the capture last logged them.
     private let counts = NSLock()
     private var out = (frames: 0, keys: 0, failed: OSStatus(0))
     private let onFrame: (Frame) -> Void
 
-    init(bitrate: Int = 12_000_000, onFrame: @escaping (Frame) -> Void) {
+    init(bitrate: Int = 1_500_000, onFrame: @escaping (Frame) -> Void) {
         self.bitrate = bitrate
         self.onFrame = onFrame
     }
 
     func requestKeyframe() { forceKey = true }
+
+    /// A new average rate, from the next frame on.
+    func setBitrate(_ b: Int) {
+        bitrate = b
+        if let session { VTSessionSetProperty(session, key: kVTCompressionPropertyKey_AverageBitRate, value: b as CFNumber) }
+    }
 
     func encode(_ pixels: CVPixelBuffer, pts: CMTime) {
         let w = CVPixelBufferGetWidth(pixels), h = CVPixelBufferGetHeight(pixels)

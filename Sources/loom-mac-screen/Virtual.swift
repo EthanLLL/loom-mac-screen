@@ -20,6 +20,18 @@ final class VirtualDisplay {
     // Room to grow into: the descriptor's maximum can't change later.
     private static let maxPixels = 4096
     private static var serial: UInt32 = 0
+
+    private static func freeSerial() -> UInt32 {
+        var n: UInt32 = 0
+        CGGetOnlineDisplayList(0, nil, &n)
+        var ids = [CGDirectDisplayID](repeating: 0, count: Int(n))
+        CGGetOnlineDisplayList(n, &ids, &n)
+        let taken = Set(ids.prefix(Int(n))
+            .filter { CGDisplayVendorNumber($0) == vendor && CGDisplayModelNumber($0) == product }
+            .map(CGDisplaySerialNumber))
+        // After the last one used, so a display just dropped is not taken again at once.
+        return (1...8).map { (serial + $0 - 1) % 8 + 1 }.first { !taken.contains($0) } ?? serial % 8 + 1
+    }
     private static let queue = DispatchQueue(label: "virtual display")
 
     init?(width: Int = defaultSize.width, height: Int = defaultSize.height) {
@@ -34,9 +46,11 @@ final class VirtualDisplay {
         d.sizeInMillimeters = CGSize(width: 300, height: 195)
         d.vendorID = Self.vendor
         d.productID = Self.product
-        // Two serials in turn: one made to replace another is a second
-        // display while both are up, not the same one again (which fails).
-        Self.serial = Self.serial % 2 + 1
+        // A serial no display of ours still listed has: one made to replace
+        // another is a second display while both are up, not the same one
+        // again (which lists no modes). Ours can outlive us for a while, so
+        // this looks at what is listed rather than taking turns.
+        Self.serial = Self.freeSerial()
         d.serialNum = Self.serial
         guard let display = CGVirtualDisplay(descriptor: d) else { return nil }
         self.display = display

@@ -17,7 +17,8 @@ import Foundation
 //   loom-mac-screen --listen 5960  its own, to try it by hand
 
 let port: UInt16 = 5960
-let idleExit: TimeInterval = 30
+// Soon after the last viewer: ending is what takes the virtual display away (Capture.swift).
+let idleExit: TimeInterval = 5
 
 func log(_ message: String) {
     FileHandle.standardError.write(Data("\(Date()) \(message)\n".utf8))
@@ -76,10 +77,12 @@ let inputQueue = DispatchQueue(label: "input", qos: .userInteractive)
 
 server.onFirst = { capture.start() }
 server.onKeyframe = { capture.keyframe() }
+server.onBehind = { capture.behind() }
 server.onInput = { data in inputQueue.async { input.handle(data) } }
 server.onSettings = { data in
     guard let m = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] else { return }
-    if let s = m["scale"] as? Int { capture.setScale(s) }
+    // Narrow unless a viewer says otherwise ("scale", from viewers before this, can't).
+    capture.setNarrow(m["narrow"] as? Bool ?? true)
     if let w = m["width"] as? Int, let h = m["height"] as? Int { capture.setSize(width: w, height: h) }
 }
 server.onLast = {

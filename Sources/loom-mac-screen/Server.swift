@@ -38,6 +38,8 @@ final class Server {
     private let socketBuffer: Int32 = 128 << 10
 
     var onFirst: () -> Void = {}
+    /// A viewer has just fallen behind.
+    var onBehind: () -> Void = {}
     var onLast: () -> Void = {}
     var onKeyframe: () -> Void = {}
     var onInput: (Data) -> Void = { _ in }
@@ -130,10 +132,11 @@ final class Server {
         message.append(Wire.message(Wire.frame, payload))
 
         let now = DispatchTime.now().uptimeNanoseconds
-        var ask = false
+        var ask = false, fell = false
         for v in lock.withLock({ Array(viewers.values) }) {
             let send: Bool = lock.withLock {
                 if let oldest = v.unsent.first, now - oldest.at > behind {
+                    if !v.waitingKey { fell = true }
                     v.waitingKey = true
                     v.askedKey = false
                     return false
@@ -153,6 +156,7 @@ final class Server {
             lock.withLock { if send { sent.written += 1 } else { sent.held += 1 } }
             if send { write(v, message, frame: true, key: frame.key) }
         }
+        if fell { onBehind() }
         if ask { onKeyframe() }
     }
 
