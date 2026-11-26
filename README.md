@@ -33,10 +33,21 @@ On the Mac, with Xcode and an Apple Development identity in the keychain:
 ./install.sh
 ```
 
-It builds, wraps the binary as `~/Applications/LoomMacScreen.app` signed with
-that identity, and loads the LaunchAgent `cloud.loom.mac-screen`. The stable
-signature is what lets macOS keep its grants across rebuilds. Grant it once in
-System Settings → Privacy & Security: Screen & System Audio Recording, and
-Accessibility.
+It builds (`./build.sh`), wraps the binary as `LoomMacScreen.app` signed with
+that identity, puts it in `~/Applications`, and loads the LaunchAgent
+`cloud.loom.mac-screen`. The stable signature is what lets macOS keep its
+grants across rebuilds. Grant it once in System Settings → Privacy & Security:
+Screen & System Audio Recording, and Accessibility.
+
+Another Mac (Apple silicon, macOS 14 or later) needs no Xcode: copy it
+`build/LoomMacScreen.app` and `install.sh`, and run
+
+```sh
+./install.sh LoomMacScreen.app
+```
+
+The app is signed for development, not notarized, so copy it in a way that
+leaves no quarantine mark (loom-node, scp); a downloaded copy is stopped by
+Gatekeeper.
 
 Logs: `~/Library/Logs/loom-mac-screen.log`.
