@@ -12,18 +12,48 @@ final class Capture: NSObject, SCStreamOutput, SCStreamDelegate {
     private(set) var displayID = CGMainDisplayID()
     private var stream: SCStream?
     private var display: SCDisplay?
-    /// The line to the viewers is narrow: anything but a phone on the Mac's
-    /// own Wi-Fi (so 5G, another network, round by the Loom, or a viewer
-    /// that never says). Narrow, the picture is a pixel a point at 1.5 Mbit/s
-    /// and 30 frames a second, steady: a lower fixed rate played smoothly
-    /// beat one chasing the line, which stalls each time it falls behind.
-    /// Wide, the viewer's own pixels at 12 Mbit/s and 60 frames a second,
-    /// halved each time a viewer falls behind and never raised again for it.
-    private var narrow = true
-    private static let wide = [12_000_000, 6_000_000, 3_000_000, 1_500_000]
-    private static let narrowRate = 1_500_000
+    /// What the line to the viewer carries, as the viewer tells it (Wire.swift):
+    /// each a ladder of fixed steps, gone down one at a time when a viewer
+    /// falls behind and never back up for it. A fixed rate below the line's
+    /// capacity plays smoothly; one chasing the line stalls each time it
+    /// falls behind. Sharp is the viewer's own pixels (2× for one that
+    /// doesn't say), otherwise a pixel a point.
+    enum Line: String {
+        /// The Mac's own network.
+        case lan
+        /// Straight across the internet, or through a TURN relay.
+        case wan
+        /// Round by the Loom, or a viewer that never says.
+        case narrow
+
+        var steps: [Step] {
+            switch self {
+            case .lan: [Step(12_000_000, 60, sharp: true), Step(6_000_000, 30, sharp: true), Step(3_000_000, 30, sharp: true), Step(1_500_000, 30, sharp: true)]
+            case .wan: [Step(3_000_000, 30, sharp: true), Step(1_500_000, 30, sharp: false)]
+            case .narrow: [Step(1_500_000, 30, sharp: false)]
+            }
+        }
+    }
+
+    struct Step: Equatable {
+        let rate: Int
+        let fps: Int32
+        let sharp: Bool
+        init(_ rate: Int, _ fps: Int32, sharp: Bool) {
+            self.rate = rate
+            self.fps = fps
+            self.sharp = sharp
+        }
+    }
+
+    private var line = Line.narrow
     private var level = 0
+    private var step: Step { line.steps[level] }
     private var lastStep = Date.distantPast
+    /// When the viewer last fell behind without it counting yet: a step down
+    /// takes a second fall, so a single stall (the line moving from a relay
+    /// to a direct path as ICE finds a better one) costs nothing for good.
+    private var lastFall: Date?
     /// The viewer's pixels for the virtual display, and the points it is
     /// laid out in: 1.5 pixels a point, so the Mac lays out about as on a
     /// laptop rather than a tablet (on the Duo's upper half 1252×889 points,
@@ -109,9 +139,10 @@ final class Capture: NSObject, SCStreamOutput, SCStreamDelegate {
         queue.async {
             self.generation += 1
             self.told = false
-            self.narrow = true
+            self.line = .narrow
             self.level = 0
-            self.encoder.setBitrate(Self.narrowRate)
+            self.lastFall = nil
+            self.encoder.setBitrate(self.step.rate)
             let stream = self.stream
             self.stream = nil
             self.last = nil
@@ -215,17 +246,22 @@ final class Capture: NSObject, SCStreamOutput, SCStreamDelegate {
         }
     }
 
-    /// Whether the viewer's line is narrow; see `narrow`.
-    func setNarrow(_ n: Bool) {
+    /// The viewer's line; see `Line`.
+    func setLine(_ l: Line) {
         queue.async {
             self.told = true
-            guard n != self.narrow else { return }
-            self.narrow = n
+            guard l != self.line else { return }
+            self.line = l
             self.level = 0
-            self.encoder.setBitrate(n ? Self.narrowRate : Self.wide[0])
-            log("line \(n ? "narrow: 1.5 Mbps, 30 frames/s" : "wide: 12 Mbps, 60 frames/s")")
+            self.lastFall = nil
+            self.encoder.setBitrate(self.step.rate)
+            log("line \(l): \(self.describe(self.step))")
             self.refit()
         }
+    }
+
+    private func describe(_ s: Step) -> String {
+        "\(Double(s.rate) / 1e6) Mbps, \(s.fps) frames/s, \(s.sharp ? "sharp" : "a pixel a point")"
     }
 
     /// A viewer's own size for the virtual display, in its pixels. Only a
@@ -260,16 +296,25 @@ final class Capture: NSObject, SCStreamOutput, SCStreamDelegate {
         }
     }
 
-    /// A viewer fell behind: on a wide line, half the rate (not again within
-    /// four seconds, while what was queued at the last one drains).
+    /// A viewer fell behind: the line's next step down, if it has one, on the
+    /// second fall within half a minute (each at least four seconds after the
+    /// one before and after the last step, while what was queued drains).
     func behind() {
         queue.async {
-            guard !self.narrow, self.level < Self.wide.count - 1, Date().timeIntervalSince(self.lastStep) >= 4 else { return }
+            let now = Date()
+            guard self.level < self.line.steps.count - 1, now.timeIntervalSince(self.lastStep) >= 4 else { return }
+            guard let fall = self.lastFall, (4...30).contains(now.timeIntervalSince(fall)) else {
+                if self.lastFall.map({ now.timeIntervalSince($0) >= 4 }) ?? true { self.lastFall = now }
+                log("viewer fell behind; the next fall within 30 s steps down")
+                return
+            }
+            self.lastFall = nil
+            let was = self.step
             self.level += 1
             self.lastStep = Date()
-            self.encoder.setBitrate(Self.wide[self.level])
-            log("encoder now \(Double(Self.wide[self.level]) / 1e6) Mbps, 30 frames/s")
-            if self.level == 1 { self.refit() }
+            self.encoder.setBitrate(self.step.rate)
+            log("encoder now \(self.describe(self.step))")
+            if self.step.fps != was.fps || self.step.sharp != was.sharp { self.refit() }
         }
     }
 
@@ -283,14 +328,15 @@ final class Capture: NSObject, SCStreamOutput, SCStreamDelegate {
 
     private func configuration(_ display: SCDisplay) -> SCStreamConfiguration {
         let c = SCStreamConfiguration()
-        // Wide, ours at the viewer's own pixels (macOS draws it at 2× and
-        // scales down), any other at 2×; narrow, a pixel a point. Even, as
+        // Sharp, ours at the viewer's own pixels (macOS draws it at 2× and
+        // scales down), any other at 2×; otherwise a pixel a point. Even, as
         // H.264 wants.
-        var size = narrow ? (display.width, display.height) : (display.width * 2, display.height * 2)
-        if !narrow, let asked, Self.madeByUs(display.displayID) { size = asked }
+        let step = self.step
+        var size = step.sharp ? (display.width * 2, display.height * 2) : (display.width, display.height)
+        if step.sharp, let asked, Self.madeByUs(display.displayID) { size = asked }
         c.width = size.0 / 2 * 2
         c.height = size.1 / 2 * 2
-        c.minimumFrameInterval = CMTime(value: 1, timescale: narrow || level >= 1 ? 30 : 60)
+        c.minimumFrameInterval = CMTime(value: 1, timescale: step.fps)
         c.pixelFormat = kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange
         c.showsCursor = true
         c.queueDepth = 4

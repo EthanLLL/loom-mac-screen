@@ -10,11 +10,14 @@ import Foundation
 //   viewer → screen
 //     10 input     JSON, see Input.swift
 //     11 keyframe  empty: the viewer has lost its place
-//     12 settings  JSON {narrow?, width?, height?}: narrow false only on
-//                  the Mac's own network (its pixels, 12 Mbit/s; otherwise
-//                  a pixel a point, 1.5 Mbit/s); width and height, the
-//                  viewer's pixels, which a virtual display (lid shut) is
-//                  laid out at 1.5 a point
+//     12 settings  JSON {line?, width?, height?}: line "lan" (the Mac's
+//                  own network: its pixels, 60 frames a second, 12 Mbit/s),
+//                  "wan" (across the internet or a TURN relay: its pixels,
+//                  3 Mbit/s), or "narrow" (round by the Loom, and the
+//                  default: a pixel a point, 1.5 Mbit/s), see Capture.Line;
+//                  `narrow: false` from viewers before it means "lan";
+//                  width and height, the viewer's pixels, which a virtual
+//                  display (lid shut) is laid out at 1.5 a point
 enum Wire {
     static let config: UInt8 = 1
     static let frame: UInt8 = 2

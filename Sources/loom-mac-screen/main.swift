@@ -81,8 +81,10 @@ server.onBehind = { capture.behind() }
 server.onInput = { data in inputQueue.async { input.handle(data) } }
 server.onSettings = { data in
     guard let m = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] else { return }
-    // Narrow unless a viewer says otherwise ("scale", from viewers before this, can't).
-    capture.setNarrow(m["narrow"] as? Bool ?? true)
+    // Narrow unless a viewer says otherwise; viewers before "line" said
+    // `narrow: false` on the Mac's own network.
+    let line = (m["line"] as? String).flatMap(Capture.Line.init(rawValue:))
+    capture.setLine(line ?? (m["narrow"] as? Bool == false ? .lan : .narrow))
     if let w = m["width"] as? Int, let h = m["height"] as? Int { capture.setSize(width: w, height: h) }
 }
 server.onLast = {

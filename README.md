@@ -8,10 +8,15 @@ the page decodes it with WebCodecs.
 
 - ScreenCaptureKit → VideoToolbox H.264 (real time, low-latency rate control,
   no B-frames, keyframes on request). An idle screen sends nothing.
-- A viewer on the Mac's own network says so (`"narrow": false` in its
-  settings) and gets its own pixels at 12 Mbit/s and 60 frames a second,
-  halved when it falls behind; any other gets a pixel a point at a steady
-  1.5 Mbit/s and 30 frames a second.
+- The viewer says what its line is (`line` in its settings), and each has
+  fixed steps, gone down one at a time when the viewer falls behind twice
+  within half a minute (once is a stall, as when the line moves from a
+  relay to a direct path), and never back up: on the Mac's own network (`lan`) its own pixels at
+  12 Mbit/s and 60 frames a second, then 30 frames at 6, 3 and 1.5;
+  across the internet or through a TURN relay (`wan`) its own pixels at
+  3 Mbit/s, then a pixel a point at 1.5; round by Loom, or a viewer that
+  doesn't say (`narrow`), a pixel a point at 1.5 Mbit/s. All but the first
+  step run at 30 frames a second.
 - Input as CGEvents, keys by position (`KeyboardEvent.code`), so the Mac's own
   input source makes the text.
 - With the lid shut and no monitor, the Mac has no display to show: a
